@@ -31,6 +31,21 @@ namespace vllm_ascend {
     const int headSize, const int64_t numTokens, const uint32_t loopCnt,
     uint32_t aivNum);
 
+  extern void group_topk_impl(
+    void* topKInput,
+    void* idxArr,
+    const uint32_t groupNum, 
+    const uint32_t k, 
+    const uint32_t kInner,
+    const uint32_t expertNumPerGroup,
+    const uint32_t expertNumPerGroupPadded, 
+    const uint32_t expertNumPerToken, 
+    const uint32_t tokenNumPerCore, 
+    const uint32_t tailTokenNum, 
+    const uint64_t tilingKey,
+    void* stream,
+    const uint32_t aiv_num);
+
   torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     if (!tensor.is_privateuseone()) {
       throw std::runtime_error("Tensor must be on NPU device");

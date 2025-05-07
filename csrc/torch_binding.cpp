@@ -26,6 +26,7 @@
 #include "aclnn/opdev/platform.h"
 #include "ops.h"
 #include "utils.h"
+#include "kernels/types.h"
 
 namespace vllm_ascend {
 
@@ -98,6 +99,71 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(at::Tensor &positions, at::T
     cmd.Run();
     return {query_dst, key_dst};
 }
+
+constexpr uint32_t DATABLOCK_SIZE = 32;
+constexpr uint32_t SORT_REPEAT_COUNT = 32;
+constexpr uint32_t B16_SIZE = 2;
+constexpr uint32_t B32_SIZE = 4;
+constexpr uint32_t DATABLOCK_NUM_PER_REPEAT = 8;
+constexpr uint32_t B16_PER_BLOCK = DATABLOCK_SIZE / B16_SIZE;
+constexpr uint32_t MAX_TILE_SIZE = 16 * 1024;
+constexpr uint64_t SINGLE_VALUE_GROUP_TILING_KEY = 900;
+constexpr uint64_t TILING_KEY_COEFFICIENT = 10;
+constexpr uint64_t TILING_KEY_VERSION = 20000000000;
+
+at::Tensor group_topk(at::Tensor &topKInput, at::Tensor &idxArr, const uint32_t groupNum, const uint32_t k, const uint32_t kInner)
+{
+    TORCH_CHECK(
+        topKInput.dim() == 2,
+        "inputs must 2 dim");
+
+    const uint32_t tokenNum = topKInput.size(0)
+    const uint32_t expertNum = topKInput.size(1)
+
+    at::ScalarType scalar_type = topKInput.scalar_type();
+    auto dtype_num = get_dtype_from_torch(scalar_type);
+    const uint32_t expertNumPerToken = expertNum;
+    const uint32_t expertNumPerGroup = expertNum / groupNum;
+    const uint32_t expertNumPerGroupAlign = kInner > 1 ? SORT_REPEAT_COUNT : B16_PER_BLOCK;
+    const uint32_t expertNumPerGroupPadded = (expertNumPerGroup + expertNumPerGroupAlign - 1) / expertNumPerGroupAlign * expertNumPerGroupAlign; // RoundUP
+
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    uint64_t tilingKey = 0;
+    if (expertNumPerGroup != 1)
+    {
+        tilingKey = static_cast<uint64_t>(kInner > 1);
+        tilingKey = tilingKey * TILING_KEY_COEFFICIENT + static_cast<uint64_t>(dtype_num == AscendType::BF16);
+        tilingKey += TILING_KEY_VERSION;
+    }
+    else
+    {
+        tilingKey = SINGLE_VALUE_GROUP_TILING_KEY + static_cast<uint64_t>(dtype_num == AscendType::BF16);
+    }
+
+    // Create and configure OpCommand
+    at_npu::native::OpCommand cmd;
+    cmd.SetCustomHandler([topKInput, idxArr, groupNum, k, kInner, expertNumPerGroup,
+                            expertNumPerGroupPadded, expertNumPerToken,, tilingKey, stream]() -> int
+                            {
+        fe::PlatFormInfos platform_infos;
+        int device_id = 0;
+        fe::PlatformInfoManager::GeInstance().GetRuntimePlatformInfosByDevice(device_id, platform_infos);
+        auto ascendcPlatform = platform_ascendc::PlatformAscendC(platform_infos);
+        auto coreNum = ascendcPlatform.GetCoreNum();
+        
+        uint32_t aivNum = platform_infos.GetCoreNumByType("aiv");
+
+        const uint32_t tokenNumPerCore = tokenNum / coreNum;
+        const uint32_t tailTokenNum = tokenNum % coreNum;
+
+        group_topk(topKInput, idxArr, groupNum, k, kInner, expertNumPerGroup,
+            expertNumPerGroupPadded, expertNumPerToken, tokenNumPerCore, tailTokenNum, tilingKey, stream, aivNum);
+        return 0;
+    });
+    cmd.Run();
+    return topKInput
+}
 } // namespace vllm_ascend
 
 TORCH_LIBRARY_EXPAND(_C, ops)
@@ -113,6 +179,14 @@ TORCH_LIBRARY_EXPAND(_C, ops)
         "                 Tensor! key, int head_size,"
         "                 Tensor cos_sin_cache, bool is_neox) -> (Tensor query, Tensor key)");
     ops.impl("rotary_embedding", torch::kPrivateUse1, &vllm_ascend::rotary_embedding);
+
+    ops.def(
+        "group_topk(Tensor topKInput, "
+        "           Tensor idxArr, "
+        "           int groupNum, "
+        "           int k, "
+        "           int kInner) -> (Tensor masked_input, Tensor mask)");
+    ops.impl("group_topk", torch::kPrivateUse1, &vllm_ascend::group_topk);
 }
 
 REGISTER_EXTENSION(_C)
